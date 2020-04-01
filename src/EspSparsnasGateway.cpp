@@ -66,7 +66,7 @@ void setup() {
 
   digitalWrite(LED_RED, LOW);
   digitalWrite(LED_GREEN, LOW);
-  digitalWrite(LED_BLUE, LOW);
+  digitalWrite(LED_BLUE, HIGH);
   delay(500);
 
   blinkerGreen.attach(0.5, changeStateLED_GREEN);
@@ -91,7 +91,7 @@ void setup() {
 
   // Setup Mqtt connection
   mClient.setServer(MQTT_SERVER, MQTT_PORT);
-  reconnect();
+  reconnect(mqtt_debug_topic, "disconnected");
 
   mqttMess = "Welcome to EspSparsnasGateway, compiled at " + String(compile_date);
   mqttMess = mqttMess + ".\nMqtt topics: " + mqtt_status_topic + ", " + mqtt_debug_topic + "\nIP: " + WiFi.localIP()[0] + "." + WiFi.localIP()[1] + "." + WiFi.localIP()[2] + "." + WiFi.localIP()[3];
@@ -131,7 +131,7 @@ void setup() {
   #ifdef DEBUG
     Serial.println(mqttMess);
   #endif
-  mqttpub(String(mqtt_debug_topic), "Device", mqttMess, mqttMess.length());
+  //mqttpub(String(mqtt_debug_topic), "Device", mqttMess, mqttMess.length());
 
   mqttMess = "Settings: \nSenderid: " + String(isendid) + "\nFrequency: " + String(ifreq);
     #ifdef DEBUG
@@ -166,7 +166,7 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   if (!mClient.connected()) {
-    reconnect();
+    reconnect(mqtt_debug_topic, "disconnected");
   }
   mClient.loop();
   //delay(10);

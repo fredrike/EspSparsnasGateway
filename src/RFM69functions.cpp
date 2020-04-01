@@ -12,7 +12,6 @@
 #define RF69_MODE_SYNTH 2      // PLL ON
 #define RF69_MODE_RX 3    // RX MODE
 #define RF69_MODE_TX 4    // TX MODE
-#define _interruptNum 5
 
 static volatile uint8_t DATA[21];
 static volatile uint8_t TEMPDATA[21];
@@ -20,11 +19,12 @@ static volatile uint8_t DATALEN;
 
 static const char* mqtt_status_topic = "EspSparsnasGateway/valuesV2";
 static const char* mqtt_debug_topic = "EspSparsnasGateway/debugV2";
-static String mqttMess;
+const String sensor_id = String(SENSOR_ID);
+const String state_topic = APPNAME "/" + sensor_id + "/state"; 
 
 extern PubSubClient mClient;
 
-#define _interruptNum 5
+#define _interruptNum D1
 static volatile bool inInterrupt = false; // Fake Mutex
 
 uint32_t FXOSC = 32000000;
@@ -39,10 +39,19 @@ uint8_t PAYLOADLENGTH = 20;
 static volatile uint8_t _mode;
 uint8_t enc_key[5];
 
+#ifdef FREQUENCY_SCAN
+uint8_t num_packages = 0;
+int16_t best_rssi = -512;
+uint32_t best_freq;
+#endif
+uint32_t glob_frequency;
+
 extern timeval tv;
 extern timespec tp;
 extern time_t now;
 extern "C" int clock_gettime(clockid_t unused, struct timespec *tp);
+
+extern void publish_mqtt(String, String);
 
 int16_t readRSSI();
 
@@ -77,13 +86,14 @@ void writeReg(uint8_t addr, uint8_t value) {
 
 void setMode(uint8_t newMode) {
 
-  #ifdef DEBUG
-     Serial.println(F("In setMode"));
-  #endif
-
   if (newMode == _mode) {
     return;
   }
+
+  #ifdef DEBUG
+     Serial.print(F("In setMode 0x"));
+     Serial.println(newMode, HEX);
+  #endif
 
   uint8_t val = readReg(REG_OPMODE);
   switch (newMode) {
@@ -150,6 +160,12 @@ int16_t readRSSI() {
   #ifdef DEBUG
     Serial.println("rssi: " + String(rssi) + "dbi");
   #endif
+  #ifdef FREQUENCY_SCAN
+    if (srssi > best_rssi) {
+      best_rssi = srssi;
+      best_freq = glob_frequency;
+    }
+  #endif
   return rssi;
 }
 
@@ -176,9 +192,6 @@ bool receiveDone() {
 }
 
 uint16_t crc16(volatile uint8_t *data, size_t n) {
-  #ifdef DEBUG
-    Serial.println("In crc16");
-  #endif
   uint16_t crcReg = 0xffff;
   size_t i, j;
   for (j = 0; j < n; j++) {
@@ -198,11 +211,16 @@ bool initialize(uint32_t frequency) {
     Serial.print("In initialize, frequency = ");
     Serial.println(frequency);
   #endif
+  #ifdef FREQUENCY_SCAN
+    if (frequency > 869400000)
+      ESP.restart();
+  #endif
+  glob_frequency = frequency;
   frequency = frequency / RF69_FSTEP;
 
   const uint8_t CONFIG[][2] = {
     /* 0x01 */ {REG_OPMODE, RF_OPMODE_SEQUENCER_ON | RF_OPMODE_LISTEN_OFF | RF_OPMODE_STANDBY},
-    /* 0x02 */ {REG_DATAMODUL, RF_DATAMODUL_DATAMODE_PACKET | RF_DATAMODUL_MODULATIONTYPE_FSK | RF_DATAMODUL_MODULATIONSHAPING_01},
+    /* 0x02 */ {REG_DATAMODUL, RF_DATAMODUL_DATAMODE_PACKET | RF_DATAMODUL_MODULATIONTYPE_FSK | RF_DATAMODUL_MODULATIONSHAPING_01}, // no shaping
     /* 0x03 */ {REG_BITRATEMSB, (uint8_t)(BITRATE >> 8)},
     /* 0x04 */ {REG_BITRATELSB, (uint8_t)(BITRATE)},
     /* 0x05 */ {REG_FDEVMSB, (uint8_t)(FREQUENCYDEVIATION >> 8)},
@@ -210,26 +228,41 @@ bool initialize(uint32_t frequency) {
     /* 0x07 */ {REG_FRFMSB, (uint8_t)(frequency >> 16)},
     /* 0x08 */ {REG_FRFMID, (uint8_t)(frequency >> 8)},
     /* 0x09 */ {REG_FRFLSB, (uint8_t)(frequency)},
-    /* 0x19 */ {REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_16 | RF_RXBW_EXP_4}, // p26 in datasheet, filters out noise
-    /* 0x25 */ {REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01},              // PayloadReady
-    /* 0x26 */ {REG_DIOMAPPING2, RF_DIOMAPPING2_CLKOUT_OFF},          // DIO5 ClkOut disable for power saving
-    /* 0x28 */ {REG_IRQFLAGS2, RF_IRQFLAGS2_FIFOOVERRUN},              // writing to this bit ensures that the FIFO & status flags are reset
-    /* 0x29 */ {REG_RSSITHRESH, RSSITHRESHOLD},
+    // looks like PA1 and PA2 are not implemented on RFM69W/CW, hence the max output power is 13dBm
+    // +17dBm and +20dBm are possible on RFM69HW
+    // +13dBm formula: Pout = -18 + OutputPower (with PA0 or PA1**)
+    // +17dBm formula: Pout = -14 + OutputPower (with PA1 and PA2)**
+    // +20dBm formula: Pout = -11 + OutputPower (with PA1 and PA2)** and high power PA settings (section 3.3.7 in datasheet)
+    ///* 0x11 */ { REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | RF_PALEVEL_OUTPUTPOWER_11111},
+    ///* 0x13 */ { REG_OCP, RF_OCP_ON | RF_OCP_TRIM_95 }, // over current protection (default is 95mA)
+
+    // RXBW defaults are { REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_24 | RF_RXBW_EXP_5} (RxBw: 10.4KHz)
+    /* 0x19 */ {REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_16 | RF_RXBW_EXP_2}, // (BitRate < 2 * RxBw)
+    //for BR-19200: /* 0x19 */ { REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_24 | RF_RXBW_EXP_3 },
+    /* 0x25 */ {REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01}, // DIO0 is the only IRQ we're using
+    /* 0x26 */ {REG_DIOMAPPING2, RF_DIOMAPPING2_CLKOUT_OFF}, // DIO5 ClkOut disable for power saving
+    /* 0x28 */ {REG_IRQFLAGS2, RF_IRQFLAGS2_FIFOOVERRUN}, // writing to this bit ensures that the FIFO & status flags are reset
+    /* 0x29 */ {REG_RSSITHRESH, 140}, // must be set to dBm = (-Sensitivity / 2), default is 0xE4 = 228 so -114dBm
     /* 0x2B */ {REG_RXTIMEOUT2, (uint8_t)0x00}, // RegRxTimeout2 (0x2B) interrupt is generated TimeoutRssiThresh *16*T bit after Rssi interrupt if PayloadReady interrupt doesn’t occur.
     /* 0x2D */ {REG_PREAMBLELSB, 3}, // default 3 preamble bytes 0xAAAAAA
     /* 0x2E */ {REG_SYNCCONFIG, RF_SYNC_ON | RF_SYNC_FIFOFILL_AUTO | RF_SYNC_SIZE_2 | RF_SYNC_TOL_0},
     /* 0x2F */ {REG_SYNCVALUE1, (uint8_t)(SYNCVALUE >> 8)},
     /* 0x30 */ {REG_SYNCVALUE2, (uint8_t)(SYNCVALUE)},
-    /* 0x37 */ {REG_PACKETCONFIG1, RF_PACKET1_FORMAT_FIXED | RF_PACKET1_DCFREE_OFF | RF_PACKET1_CRC_OFF | RF_PACKET1_CRCAUTOCLEAR_ON | RF_PACKET1_ADRSFILTERING_OFF},
-    /* 0x38 */ {REG_PAYLOADLENGTH, PAYLOADLENGTH},
-    /* 0x3C */ {REG_FIFOTHRESH, RF_FIFOTHRESH_TXSTART_FIFONOTEMPTY | RF_FIFOTHRESH_VALUE},               // TX on FIFO not empty
+    //* 0x31 */ {REG_SYNCVALUE3, 0xAA},
+    //* 0x32 */ {REG_SYNCVALUE4, 0xBB},
+    /* 0x37 */ {REG_PACKETCONFIG1, RF_PACKET1_FORMAT_FIXED | RF_PACKET1_DCFREE_OFF | RF_PACKET1_CRC_OFF | RF_PACKET1_CRCAUTOCLEAR_ON | RF_PACKET1_ADRSFILTERING_OFF },
+    /* 0x38 */ {REG_PAYLOADLENGTH, PAYLOADLENGTH }, // in variable length mode: the max frame size, not used in TX
+    ///* 0x39 */ {REG_NODEADRS, nodeID}, // turned off because we're not using address filtering
+    /* 0x3C */ {REG_FIFOTHRESH, RF_FIFOTHRESH_TXSTART_FIFONOTEMPTY | RF_FIFOTHRESH_VALUE}, // TX on FIFO not empty
     /* 0x3D */ {REG_PACKETCONFIG2, RF_PACKET2_RXRESTARTDELAY_2BITS | RF_PACKET2_AUTORXRESTART_ON | RF_PACKET2_AES_OFF}, // RXRESTARTDELAY must match transmitter PA ramp-down time (bitrate dependent)
+    //for BR-19200: /* 0x3D */ { REG_PACKETCONFIG2, RF_PACKET2_RXRESTARTDELAY_NONE | RF_PACKET2_AUTORXRESTART_ON | RF_PACKET2_AES_OFF}, // RXRESTARTDELAY must match transmitter PA ramp-down time (bitrate dependent)
     /* 0x6F */ {REG_TESTDAGC, RF_DAGC_IMPROVED_LOWBETA0}, // run DAGC continuously in RX mode for Fading Margin Improvement, recommended default for AfcLowBetaOn=0
     {255, 0}
   };
 
-  digitalWrite(SS, HIGH);
   pinMode(SS, OUTPUT);
+  digitalWrite(SS, HIGH);
+
   SPI.begin();
   SPI.setDataMode(SPI_MODE0);
   SPI.setBitOrder(MSBFIRST);
@@ -241,7 +274,7 @@ bool initialize(uint32_t frequency) {
   uint8_t timeout = 50;
   do {
     writeReg(REG_SYNCVALUE1, 0xAA);
-    yield();
+    //yield();
   } while (readReg(REG_SYNCVALUE1) != 0xaa && millis() - start < timeout);
   if (readReg(REG_SYNCVALUE1) != 0xaa) {
     #ifdef DEBUG
@@ -252,7 +285,7 @@ bool initialize(uint32_t frequency) {
   start = millis();
   do {
     writeReg(REG_SYNCVALUE1, 0x55);
-    yield();
+    //yield();
   } while (readReg(REG_SYNCVALUE1) != 0x55 && millis() - start < timeout);
   if (readReg(REG_SYNCVALUE1) != 0x55) {
     #ifdef DEBUG
@@ -262,7 +295,7 @@ bool initialize(uint32_t frequency) {
   }
   for (uint8_t i = 0; CONFIG[i][0] != 255; i++) {
     writeReg(CONFIG[i][0], CONFIG[i][1]);
-    yield();
+    //yield();
   }
 
   setMode(RF69_MODE_STANDBY);
@@ -298,6 +331,10 @@ void  ICACHE_RAM_ATTR interruptHandler() {
   digitalWrite(LED_BLUE, HIGH);
 
   if (_mode == RF69_MODE_RX && (readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY)) {
+    #ifdef DEBUG
+      Serial.print(F("Got rf data, "));
+    #endif
+
 
     // Read Rssi
     int16_t srssi = readRSSI();
@@ -318,10 +355,6 @@ void  ICACHE_RAM_ATTR interruptHandler() {
     uint16_t crc = crc16(TEMPDATA, 18);
     uint16_t packet_crc = TEMPDATA[18] << 8 | TEMPDATA[19];
 
-    #ifdef DEBUG
-      Serial.println(F("Got rf data"));
-    #endif
-
     const uint32_t sensor_id_sub = SENSOR_ID - 0x5D38E8CB;
     enc_key[0] = (uint8_t)(sensor_id_sub >> 24);
     enc_key[1] = (uint8_t)(sensor_id_sub);
@@ -341,15 +374,28 @@ void  ICACHE_RAM_ATTR interruptHandler() {
     // if (TEMPDATA[0] != 0x11 || TEMPDATA[1] != (SENSOR_ID & 0xFF) || TEMPDATA[3] != 0x07 || TEMPDATA[4] != 0x0E || rcv_sensor_id != SENSOR_ID) {
     if (TEMPDATA[0] != 0x11 || TEMPDATA[1] != (SENSOR_ID & 0xFF) || TEMPDATA[3] != 0x07 || rcv_sensor_id != SENSOR_ID) {
       #ifdef DEBUG
-        output = "";
-        Serial.println("Bad packet!");
+        #ifdef FREQUENCY_SCAN
+          Serial.println(String("Bad packet! cnt:") + String(num_packages) + String(" best freq: ") + String(best_freq) + "kHz @ " + String(best_rssi) + "dBi" );
+        #else
+          Serial.println("Bad packet!");
+        #endif
         for (uint8_t i = 0; i < 20; i++) {
            if (TEMPDATA[i]<0x10) {Serial.print("0");}
            Serial.print(TEMPDATA[i],HEX);
            Serial.print(" ");
         }
         Serial.println(" ");
-
+      #endif
+      #ifdef FREQUENCY_SCAN
+      if(num_packages++ > 5) {
+        if (initialize(glob_frequency + (uint32_t)10000)) {
+          #ifdef DEBUG
+            String mqttMess =  "Radio initialized.\nListening on " + String(glob_frequency/1000) + "khz. Done in setup.";
+            Serial.println(mqttMess);
+          #endif
+          num_packages = 0;
+        }
+      }
       #endif
     } else {
       #ifdef DEBUG
@@ -427,14 +473,14 @@ void  ICACHE_RAM_ATTR interruptHandler() {
       float vcc = ESP.getVcc();
       output += "Vcc: " + String(vcc) + "mV";
       Serial.println(output);
+      //mClient.printf_P(mqtt_debug_topic, output.c_str(), );
 
-      const size_t capacity = JSON_OBJECT_SIZE(9);
+      const size_t capacity = JSON_OBJECT_SIZE(10);
       DynamicJsonDocument status(capacity);
       if (err=="CRC ERR") {
         Serial.println(err);
         status["error"] = "CRC Error";
         analogWrite(LED_RED, LED_RED_BRIGHTNESS);
-        mClient.publish((char*) String(mqtt_debug_topic).c_str(), (char*) output.c_str());
         delay(300);
         analogWrite(LED_RED, 0);
       }
@@ -450,19 +496,23 @@ void  ICACHE_RAM_ATTR interruptHandler() {
       status["rssi"] = srssi;
       status["power"] = power;
       status["pulse"] = pulse;
+      #ifdef FREQUENCY_SCAN
+        status["frequence"] = glob_frequency; //868010kHz
+      #endif
 
-      mqttMess = "";
+      String mqttMess;
       serializeJson(status, mqttMess);
 
       if (status["error"] == "") {
-        mClient.publish((char*) String(mqtt_status_topic).c_str(), (char*) mqttMess.c_str());
+        publish_mqtt(state_topic, mqttMess);
+        //mClient.publish((char*) String(mqtt_status_topic).c_str(), (char*) mqttMess.c_str());
       }
-      analogWrite(LED_BLUE, 0);
+      analogWrite(LED_BLUE, HIGH);
     }
     unselect();
     setMode(RF69_MODE_RX);
   }
-  digitalWrite(LED_BLUE, LOW);
+  digitalWrite(LED_BLUE, HIGH);
 
   //Serial.println("Int done");
   inInterrupt = false;
